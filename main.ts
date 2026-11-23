@@ -158,7 +158,30 @@ function changeLines(t: Tree): string[] {
 type Edit =
   | { type: 'jcreate'; path: string; text: string }
   | { type: 'jreplace'; path: string; oldStr: string; newStr: string }
-  | { type: 'jinsert'; path: string; line: number; text: string };
+  | { type: 'jinsert'; path: string; line: number; text: string }
+  | UnifiedEdit;
+
+// One line of a hunk or chunk body: ' ' context, '-' old, '+' new, '\\' the
+// no-line-break marker. `blank` remembers that the patch line itself was
+// empty (an empty context line), which matters at the end of a body.
+interface BodyLine {
+  t: ' ' | '-' | '+' | '\\';
+  text: string;
+  blank: boolean;
+}
+
+interface Hunk {
+  a: number; // the A of @@ -A[,B] +C[,D] @@; B, C and D are not used
+  body: BodyLine[];
+}
+
+interface UnifiedEdit {
+  type: 'unified';
+  mode: 'create' | 'delete' | 'move' | 'change';
+  oldPath: string | null; // null: /dev/null
+  newPath: string | null;
+  hunks: Hunk[];
+}
 
 // ---------------------------------------------------------------------------
 // The command line (SPEC section 1)
@@ -299,10 +322,339 @@ function parseJson(text: string, lines: string[]): Edit[] {
 }
 
 // ---------------------------------------------------------------------------
-// Applying edits (SPEC sections 9 and 10)
+// Matching lines (SPEC section 5). O, the old lines an edit names, is found
+// at the first tier at which it occurs at least once; occurrences may
+// overlap. Stage 2 matches at tier 0 only; the looser tiers follow.
 
-function applyEdit(t: Tree, e: Edit, _strict: boolean): string | null {
+function lineEq(a: string, b: string, tier: number): boolean {
+  if (tier === 0) return a === b;
+  if (tier === 1) return a.replace(/[ \t]+$/, '') === b.replace(/[ \t]+$/, '');
+  return a.replace(/^[ \t]+|[ \t]+$/g, '') === b.replace(/^[ \t]+|[ \t]+$/g, '');
+}
+
+function findOccurrences(lines: string[], O: string[], tier: number, from: number): number[] {
+  const res: number[] = [];
+  for (let i = from; i + O.length <= lines.length; i++) {
+    let ok = true;
+    for (let j = 0; j < O.length; j++) {
+      if (!lineEq(lines[i + j], O[j], tier)) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) res.push(i);
+  }
+  return res;
+}
+
+function findTier(
+  lines: string[],
+  O: string[],
+  strict: boolean,
+  from = 0,
+): { tier: number; positions: number[] } | null {
+  const tiers = strict ? [0] : [0];
+  for (const tier of tiers) {
+    const positions = findOccurrences(lines, O, tier, from);
+    if (positions.length > 0) return { tier, positions };
+  }
+  return null;
+}
+
+// One item of a replacement: a context line (written as the file's own
+// matched line, never the patch's) or an added line.
+interface NItem {
+  kind: 'ctx' | 'add';
+  oIndex: number; // for 'ctx': the line's index within O
+  text: string; // for 'add': the line to write
+}
+
+function buildNew(lines: string[], pos: number, _O: string[], items: NItem[], _tier: number): string[] {
+  return items.map((it) => (it.kind === 'ctx' ? lines[pos + it.oIndex] : it.text));
+}
+
+// ---------------------------------------------------------------------------
+// Unified diffs (SPEC section 6)
+
+// The path of a --- or +++ line: the text after the four characters, up to
+// the first tab, with surrounding spaces removed and a leading a/ or b/
+// taken off.
+function headerPath(line: string): string {
+  let text = line.slice(4);
+  const tab = text.indexOf('\t');
+  if (tab >= 0) text = text.slice(0, tab);
+  text = text.replace(/^ +| +$/g, '');
+  if (text.startsWith('a/') || text.startsWith('b/')) text = text.slice(2);
+  return text;
+}
+
+// The two paths of a `diff --git a/<X> b/<Y>` line, or null when the line
+// is not of that form.
+function diffGitPaths(line: string): [string, string] | null {
+  if (!line.startsWith('diff --git ')) return null;
+  const rest = line.slice('diff --git '.length);
+  if (!rest.startsWith('a/')) return null;
+  const idx = rest.indexOf(' b/', 2);
+  if (idx < 0) return null;
+  const x = rest.slice(2, idx);
+  const y = rest.slice(idx + 3);
+  if (x === '' || y === '') return null;
+  return [x, y];
+}
+
+interface SectionAcc {
+  diffOld?: string;
+  diffNew?: string;
+  dashOld?: string;
+  dashNew?: string;
+  renameFrom?: string;
+  renameTo?: string;
+  newFile: boolean;
+  delFile: boolean;
+  pairSeen: boolean;
+  inHeader: boolean;
+  hunks: Hunk[];
+}
+
+function finalizeSection(sec: SectionAcc): UnifiedEdit {
+  const oldRaw = sec.dashOld !== undefined ? sec.dashOld : sec.renameFrom !== undefined ? sec.renameFrom : sec.diffOld;
+  const newRaw = sec.dashNew !== undefined ? sec.dashNew : sec.renameTo !== undefined ? sec.renameTo : sec.diffNew;
+  const oldPath = oldRaw === '/dev/null' ? null : oldRaw ?? null;
+  const newPath = newRaw === '/dev/null' ? null : newRaw ?? null;
+  let mode: UnifiedEdit['mode'];
+  if (sec.newFile || oldPath === null) mode = 'create';
+  else if (sec.delFile || newPath === null) mode = 'delete';
+  else if (oldPath !== newPath) mode = 'move';
+  else mode = 'change';
+  return { type: 'unified', mode, oldPath, newPath, hunks: sec.hunks };
+}
+
+const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+
+function parseUnified(lines: string[]): Edit[] {
+  const edits: Edit[] = [];
+  let sec: SectionAcc | null = null;
+  let hunk: Hunk | null = null;
+
+  const closeHunk = (): void => {
+    if (hunk !== null && sec !== null) {
+      // Empty lines at the end of a body are not part of it.
+      while (hunk.body.length > 0 && hunk.body[hunk.body.length - 1].blank) hunk.body.pop();
+      sec.hunks.push(hunk);
+    }
+    hunk = null;
+  };
+  const closeSection = (): void => {
+    closeHunk();
+    if (sec !== null) edits.push(finalizeSection(sec));
+    sec = null;
+  };
+  const newSection = (): SectionAcc => {
+    closeSection();
+    sec = { newFile: false, delFile: false, pairSeen: false, inHeader: true, hunks: [] };
+    return sec;
+  };
+  const startPairSection = (i: number): void => {
+    const s = newSection();
+    s.dashOld = headerPath(lines[i]);
+    s.dashNew = headerPath(lines[i + 1]);
+    s.pairSeen = true;
+  };
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const n = i + 1;
+
+    if (hunk !== null) {
+      if (line.startsWith('--- ') && i + 1 < lines.length && lines[i + 1].startsWith('+++ ')) {
+        startPairSection(i);
+        i += 2;
+        continue;
+      }
+      if (line === '' || line[0] === ' ' || line[0] === '-' || line[0] === '+' || line[0] === '\\') {
+        hunk.body.push({
+          t: line === '' ? ' ' : (line[0] as BodyLine['t']),
+          text: line === '' ? '' : line.slice(1),
+          blank: line === '',
+        });
+        i++;
+        continue;
+      }
+      closeHunk(); // the body ended; the line is read again below
+    }
+
+    if (line === 'diff --git' || line.startsWith('diff --git ')) {
+      const paths = diffGitPaths(line);
+      if (paths === null) throw new ParseError(n);
+      const s = newSection();
+      s.diffOld = paths[0];
+      s.diffNew = paths[1];
+      i++;
+      continue;
+    }
+
+    if (line.startsWith('@@')) {
+      if (sec === null) throw new ParseError(n); // a hunk before any section
+      const m = HUNK_RE.exec(line);
+      if (m === null) throw new ParseError(n);
+      sec.inHeader = false;
+      hunk = { a: parseInt(m[1], 10), body: [] };
+      i++;
+      continue;
+    }
+
+    if (line.startsWith('--- ')) {
+      const followed = i + 1 < lines.length && lines[i + 1].startsWith('+++ ');
+      if (sec !== null && sec.inHeader) {
+        if (!followed) throw new ParseError(n + 1);
+        if (sec.pairSeen) {
+          startPairSection(i);
+        } else {
+          sec.dashOld = headerPath(line);
+          sec.dashNew = headerPath(lines[i + 1]);
+          sec.pairSeen = true;
+        }
+        i += 2;
+        continue;
+      }
+      if (followed) {
+        startPairSection(i);
+        i += 2;
+        continue;
+      }
+      i++; // a --- line outside a header, not followed by +++: prose
+      continue;
+    }
+
+    if (sec !== null && sec.inHeader) {
+      if (line.startsWith('rename from ')) sec.renameFrom = line.slice('rename from '.length);
+      else if (line.startsWith('rename to ')) sec.renameTo = line.slice('rename to '.length);
+      else if (line.startsWith('new file mode')) sec.newFile = true;
+      else if (line.startsWith('deleted file mode')) sec.delFile = true;
+      else if (line.startsWith('+++ ') && !sec.pairSeen) sec.dashNew = headerPath(line);
+      // index, mode and every other header line is ignored
+    }
+    i++;
+  }
+  closeSection();
+  return edits;
+}
+
+// Apply one section's hunks, in order, each to the result of the ones
+// before it. Returns the new lines and final-break flag, or an error code.
+function applyHunks(
+  f: FileLines,
+  hunks: Hunk[],
+  strict: boolean,
+): { lines: string[]; end: boolean } | string {
+  let lines = [...f.lines];
+  let end = f.end;
+  let d = 0; // the sum over this section's hunks so far of (N - O) lengths
+  for (const h of hunks) {
+    const O: string[] = [];
+    const items: NItem[] = [];
+    for (const bl of h.body) {
+      if (bl.t === ' ') {
+        items.push({ kind: 'ctx', oIndex: O.length, text: bl.text });
+        O.push(bl.text);
+      } else if (bl.t === '-') {
+        O.push(bl.text);
+      } else if (bl.t === '+') {
+        items.push({ kind: 'add', oIndex: -1, text: bl.text });
+      }
+    }
+    // A '\' line after the hunk's last context or '+' line takes the final
+    // line break away when the hunk runs to the end of the file.
+    let noBreak = false;
+    for (let k = h.body.length - 1; k >= 0; k--) {
+      if (h.body[k].t === ' ' || h.body[k].t === '+') {
+        noBreak = h.body[k + 1]?.t === '\\';
+        break;
+      }
+    }
+    if (O.length === 0) {
+      const pos = Math.max(0, Math.min(h.a + d, lines.length));
+      const atEnd = pos === lines.length;
+      const texts = items.map((it) => it.text);
+      lines.splice(pos, 0, ...texts);
+      if (atEnd) end = !noBreak;
+      d += texts.length;
+      continue;
+    }
+    const found = findTier(lines, O, strict);
+    if (found === null) return 'no-match';
+    // The occurrence whose position is nearest to A - 1 + d; ties go early.
+    const target = h.a - 1 + d;
+    let pos = found.positions[0];
+    for (const p of found.positions) {
+      if (Math.abs(p - target) < Math.abs(pos - target)) pos = p;
+    }
+    const newLines = buildNew(lines, pos, O, items, found.tier);
+    const reachesEnd = pos + O.length === lines.length;
+    lines.splice(pos, O.length, ...newLines);
+    if (reachesEnd) end = !noBreak;
+    d += newLines.length - O.length;
+  }
+  return { lines, end };
+}
+
+function applyUnified(t: Tree, e: UnifiedEdit, strict: boolean): string | null {
+  if (e.oldPath !== null && !isSafePath(e.oldPath)) return `unsafe ${e.oldPath}`;
+  if (e.newPath !== null && !isSafePath(e.newPath)) return `unsafe ${e.newPath}`;
+  if (e.mode === 'create') {
+    const target = e.newPath ?? '';
+    if (!isSafePath(target)) return `unsafe ${target}`;
+    if (treeGet(t, target) !== null) return `exists ${target}`;
+    // The file is the '+' lines of all its hunks, in order; it ends with a
+    // line break unless a '\' line follows its last '+' line.
+    const content: string[] = [];
+    let noBreak = false;
+    for (const h of e.hunks) {
+      h.body.forEach((bl, idx) => {
+        if (bl.t === '+') {
+          content.push(bl.text);
+          noBreak = h.body[idx + 1]?.t === '\\';
+        }
+      });
+    }
+    const text = content.length === 0 ? '' : content.join('\n') + (noBreak ? '' : '\n');
+    treeSet(t, target, text);
+    return null;
+  }
+  if (e.mode === 'delete') {
+    const target = e.oldPath ?? '';
+    if (!isSafePath(target)) return `unsafe ${target}`;
+    if (treeGet(t, target) === null) return `missing ${target}`;
+    treeSet(t, target, null);
+    return null;
+  }
+  const from = e.oldPath ?? '';
+  const to = e.newPath ?? '';
+  const content = treeGet(t, from);
+  if (content === null) return `missing ${from}`;
+  if (e.mode === 'move' && treeGet(t, to) !== null) return `exists ${to}`;
+  const f = splitFile(content);
+  const applied = applyHunks(f, e.hunks, strict);
+  if (typeof applied === 'string') return `${applied} ${from}`;
+  const text = joinFile({ lines: applied.lines, brk: f.brk, end: applied.end });
+  if (e.mode === 'move') {
+    treeSet(t, to, text);
+    treeSet(t, from, null);
+    t.moves.push([from, to]);
+  } else {
+    treeSet(t, from, text);
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Applying edits (SPEC sections 6, 9 and 10)
+
+function applyEdit(t: Tree, e: Edit, strict: boolean): string | null {
   switch (e.type) {
+    case 'unified':
+      return applyUnified(t, e, strict);
     case 'jcreate': {
       if (!isSafePath(e.path)) return `unsafe ${e.path}`;
       if (treeGet(t, e.path) !== null) return `exists ${e.path}`;
@@ -401,8 +753,10 @@ function parsePatch(format: string, text: string, lines: string[]): Edit[] {
   switch (format) {
     case 'json':
       return parseJson(text, lines);
+    case 'unified':
+      return parseUnified(lines);
     default:
-      // The unified, search-replace and v4a readers are added in later stages.
+      // The search-replace and v4a readers are added in later stages.
       throw new ParseError(1);
   }
 }
