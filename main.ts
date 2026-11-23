@@ -324,7 +324,8 @@ function parseJson(text: string, lines: string[]): Edit[] {
 // ---------------------------------------------------------------------------
 // Matching lines (SPEC section 5). O, the old lines an edit names, is found
 // at the first tier at which it occurs at least once; occurrences may
-// overlap. Stage 2 matches at tier 0 only; the looser tiers follow.
+// overlap. Tier 0 is byte-equal, tier 1 ignores trailing spaces and tabs,
+// tier 2 ignores leading ones as well. --strict tries tier 0 only.
 
 function lineEq(a: string, b: string, tier: number): boolean {
   if (tier === 0) return a === b;
@@ -353,7 +354,7 @@ function findTier(
   strict: boolean,
   from = 0,
 ): { tier: number; positions: number[] } | null {
-  const tiers = strict ? [0] : [0];
+  const tiers = strict ? [0] : [0, 1, 2];
   for (const tier of tiers) {
     const positions = findOccurrences(lines, O, tier, from);
     if (positions.length > 0) return { tier, positions };
@@ -369,8 +370,24 @@ interface NItem {
   text: string; // for 'add': the line to write
 }
 
-function buildNew(lines: string[], pos: number, _O: string[], items: NItem[], _tier: number): string[] {
-  return items.map((it) => (it.kind === 'ctx' ? lines[pos + it.oIndex] : it.text));
+function buildNew(lines: string[], pos: number, O: string[], items: NItem[], tier: number): string[] {
+  // At tier 2 every added line is re-indented: F is the leading spaces and
+  // tabs of the file's first matched line and P those of O's first line; a
+  // line that is not empty and not only whitespace, and starts with P, has
+  // that P replaced by F. Any other line is written as it is. Context lines
+  // are always the file's own matched lines.
+  let F = '';
+  let P = '';
+  if (tier === 2 && O.length > 0) {
+    F = /^[ \t]*/.exec(lines[pos])?.[0] ?? '';
+    P = /^[ \t]*/.exec(O[0])?.[0] ?? '';
+  }
+  return items.map((it) => {
+    if (it.kind === 'ctx') return lines[pos + it.oIndex];
+    const s = it.text;
+    if (tier === 2 && s !== '' && !/^[ \t]+$/.test(s) && s.startsWith(P)) return F + s.slice(P.length);
+    return s;
+  });
 }
 
 // ---------------------------------------------------------------------------
