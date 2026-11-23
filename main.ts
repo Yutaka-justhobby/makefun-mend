@@ -159,7 +159,9 @@ type Edit =
   | { type: 'jcreate'; path: string; text: string }
   | { type: 'jreplace'; path: string; oldStr: string; newStr: string }
   | { type: 'jinsert'; path: string; line: number; text: string }
-  | UnifiedEdit;
+  | UnifiedEdit
+  | SREdit
+  | VEdit;
 
 // One line of a hunk or chunk body: ' ' context, '-' old, '+' new, '\\' the
 // no-line-break marker. `blank` remembers that the patch line itself was
@@ -182,6 +184,24 @@ interface UnifiedEdit {
   newPath: string | null;
   hunks: Hunk[];
 }
+
+interface SREdit {
+  type: 'sr';
+  path: string;
+  oldLines: string[];
+  newLines: string[];
+}
+
+interface VChunk {
+  anchor: string | null;
+  eof: boolean;
+  body: BodyLine[];
+}
+
+type VEdit =
+  | { type: 'vadd'; path: string; lines: string[] }
+  | { type: 'vdelete'; path: string }
+  | { type: 'vupdate'; path: string; moveTo: string | null; chunks: VChunk[] };
 
 // ---------------------------------------------------------------------------
 // The command line (SPEC section 1)
@@ -666,12 +686,280 @@ function applyUnified(t: Tree, e: UnifiedEdit, strict: boolean): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Applying edits (SPEC sections 6, 9 and 10)
+// SEARCH/REPLACE blocks (SPEC section 7)
+
+function parseSearchReplace(lines: string[]): Edit[] {
+  const edits: Edit[] = [];
+  const marker = (l: string): string => l.replace(/\s+$/, '');
+  let prevPath: string | null = null;
+  let searchFrom = 0; // lines before this index belong to earlier blocks
+  let i = 0;
+  while (i < lines.length) {
+    if (marker(lines[i]) !== '<<<<<<< SEARCH') {
+      i++;
+      continue;
+    }
+    const searchLine = i + 1;
+    // The path is the nearest line before the SEARCH line, after the
+    // previous block, that is not blank and does not open a code fence.
+    let path: string | null = null;
+    for (let j = i - 1; j >= searchFrom; j--) {
+      const t = lines[j].trim();
+      if (t === '' || t.startsWith('```')) continue;
+      path = t;
+      break;
+    }
+    if (path === null) path = prevPath;
+    if (path === null) throw new ParseError(searchLine);
+    let j = i + 1;
+    while (j < lines.length && marker(lines[j]) !== '=======') {
+      if (marker(lines[j]) === '>>>>>>> REPLACE') throw new ParseError(searchLine);
+      j++;
+    }
+    if (j >= lines.length) throw new ParseError(searchLine);
+    const oldLines = lines.slice(i + 1, j);
+    let k = j + 1;
+    while (k < lines.length && marker(lines[k]) !== '>>>>>>> REPLACE') k++;
+    if (k >= lines.length) throw new ParseError(searchLine);
+    const newLines = lines.slice(j + 1, k);
+    edits.push({ type: 'sr', path, oldLines, newLines });
+    prevPath = path;
+    searchFrom = k + 1;
+    i = k + 1;
+  }
+  return edits;
+}
+
+function applySR(t: Tree, e: SREdit, strict: boolean): string | null {
+  if (!isSafePath(e.path)) return `unsafe ${e.path}`;
+  if (e.oldLines.length === 0) {
+    // An empty old side creates the file with the new lines.
+    if (treeGet(t, e.path) !== null) return `exists ${e.path}`;
+    const text = e.newLines.length === 0 ? '' : e.newLines.join('\n') + '\n';
+    treeSet(t, e.path, text);
+    return null;
+  }
+  const content = treeGet(t, e.path);
+  if (content === null) return `missing ${e.path}`;
+  const f = splitFile(content);
+  const found = findTier(f.lines, e.oldLines, strict);
+  if (found === null) return `no-match ${e.path}`;
+  if (found.positions.length > 1) return `ambiguous ${e.path}`;
+  const pos = found.positions[0];
+  const items: NItem[] = e.newLines.map((text) => ({ kind: 'add', oIndex: -1, text }));
+  const newLines = buildNew(f.lines, pos, e.oldLines, items, found.tier);
+  f.lines.splice(pos, e.oldLines.length, ...newLines);
+  treeSet(t, e.path, joinFile(f));
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// V4A patches (SPEC section 8)
+
+function parseV4A(lines: string[]): Edit[] {
+  let first = -1;
+  let last = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() !== '') {
+      if (first < 0) first = i;
+      last = i;
+    }
+  }
+  if (first < 0) throw new ParseError(1);
+  if (lines[first].trim() !== '*** Begin Patch') throw new ParseError(first + 1);
+  if (lines[last].trim() !== '*** End Patch') throw new ParseError(lines.length + 1);
+
+  const sectionStart = (l: string): 'add' | 'delete' | 'update' | null => {
+    if (l.startsWith('*** Add File:')) return 'add';
+    if (l.startsWith('*** Delete File:')) return 'delete';
+    if (l.startsWith('*** Update File:')) return 'update';
+    return null;
+  };
+
+  const edits: Edit[] = [];
+  let i = first + 1;
+  while (i < last) {
+    const line = lines[i];
+    if (line.trim() === '') {
+      i++;
+      continue;
+    }
+    const kind = sectionStart(line);
+    if (kind === null) throw new ParseError(i + 1);
+    const startLine = i + 1;
+    // The section's lines run until the next section or the End Patch;
+    // blank lines at its end are not part of it.
+    let j = i + 1;
+    while (j < last && sectionStart(lines[j]) === null) j++;
+    const range = lines.slice(i + 1, j);
+    let rangeEnd = range.length;
+    while (rangeEnd > 0 && range[rangeEnd - 1].trim() === '') rangeEnd--;
+    const body = range.slice(0, rangeEnd);
+
+    if (kind === 'add') {
+      const path = line.slice('*** Add File:'.length).trim();
+      const content: string[] = [];
+      body.forEach((l, k) => {
+        if (l.startsWith('+')) content.push(l.slice(1));
+        else if (l === '') content.push('');
+        else throw new ParseError(i + 2 + k);
+      });
+      edits.push({ type: 'vadd', path, lines: content });
+    } else if (kind === 'delete') {
+      const path = line.slice('*** Delete File:'.length).trim();
+      body.forEach((l, k) => {
+        if (l.trim() !== '') throw new ParseError(i + 2 + k);
+      });
+      edits.push({ type: 'vdelete', path });
+    } else {
+      const path = line.slice('*** Update File:'.length).trim();
+      let moveTo: string | null = null;
+      const chunks: VChunk[] = [];
+      let cur: VChunk | null = null;
+      let m = 0;
+      if (m < body.length && body[m].startsWith('*** Move to:')) {
+        moveTo = body[m].slice('*** Move to:'.length).trim();
+        m++;
+      }
+      for (; m < body.length; m++) {
+        const l = body[m];
+        const lineNo = i + 2 + m;
+        if (l.startsWith('@@')) {
+          const anchorText = l.slice(2).trim();
+          cur = { anchor: anchorText === '' ? null : anchorText, eof: false, body: [] };
+          chunks.push(cur);
+          continue;
+        }
+        if (l === '*** End of File') {
+          if (cur === null) throw new ParseError(lineNo);
+          cur.eof = true;
+          cur = null;
+          continue;
+        }
+        if (l === '' || l[0] === ' ' || l[0] === '-' || l[0] === '+') {
+          if (cur === null) {
+            // Only the first chunk may start at a body line.
+            if (chunks.length > 0) throw new ParseError(lineNo);
+            cur = { anchor: null, eof: false, body: [] };
+            chunks.push(cur);
+          }
+          cur.body.push({
+            t: l === '' ? ' ' : (l[0] as BodyLine['t']),
+            text: l === '' ? '' : l.slice(1),
+            blank: l === '',
+          });
+          continue;
+        }
+        throw new ParseError(lineNo);
+      }
+      if (chunks.length === 0 && moveTo === null) throw new ParseError(startLine);
+      edits.push({ type: 'vupdate', path, moveTo, chunks });
+    }
+    i = j;
+  }
+  return edits;
+}
+
+function applyVUpdate(t: Tree, e: Extract<VEdit, { type: 'vupdate' }>, strict: boolean): string | null {
+  if (!isSafePath(e.path)) return `unsafe ${e.path}`;
+  if (e.moveTo !== null && !isSafePath(e.moveTo)) return `unsafe ${e.moveTo}`;
+  const content = treeGet(t, e.path);
+  if (content === null) return `missing ${e.path}`;
+  if (e.moveTo !== null && treeGet(t, e.moveTo) !== null) return `exists ${e.moveTo}`;
+  const f = splitFile(content);
+  const lines = f.lines;
+  let cursor = 0;
+  for (const chunk of e.chunks) {
+    if (chunk.anchor !== null) {
+      // The first line at or after the cursor equal to the anchor, at the
+      // first tier where one is.
+      const tiers = strict ? [0] : [0, 1, 2];
+      let anchorAt = -1;
+      for (const tier of tiers) {
+        for (let k = cursor; k < lines.length; k++) {
+          if (lineEq(lines[k], chunk.anchor, tier)) {
+            anchorAt = k;
+            break;
+          }
+        }
+        if (anchorAt >= 0) break;
+      }
+      if (anchorAt < 0) return `no-match ${e.path}`;
+      cursor = anchorAt + 1;
+    }
+    const O: string[] = [];
+    const items: NItem[] = [];
+    for (const bl of chunk.body) {
+      if (bl.t === ' ') {
+        items.push({ kind: 'ctx', oIndex: O.length, text: bl.text });
+        O.push(bl.text);
+      } else if (bl.t === '-') {
+        O.push(bl.text);
+      } else if (bl.t === '+') {
+        items.push({ kind: 'add', oIndex: -1, text: bl.text });
+      }
+    }
+    if (O.length === 0) {
+      const pos = chunk.eof ? lines.length : cursor;
+      const texts = items.map((it) => it.text);
+      lines.splice(pos, 0, ...texts);
+      cursor = pos + texts.length;
+      continue;
+    }
+    const found = findTier(lines, O, strict, cursor);
+    if (found === null) return `no-match ${e.path}`;
+    let positions = found.positions;
+    if (chunk.eof) positions = positions.filter((p) => p + O.length === lines.length);
+    if (positions.length === 0) return `no-match ${e.path}`;
+    const pos = positions[0];
+    const newLines = buildNew(lines, pos, O, items, found.tier);
+    lines.splice(pos, O.length, ...newLines);
+    cursor = pos + newLines.length;
+  }
+  const text = joinFile({ lines, brk: f.brk, end: f.end });
+  if (e.moveTo !== null) {
+    treeSet(t, e.moveTo, text);
+    treeSet(t, e.path, null);
+    t.moves.push([e.path, e.moveTo]);
+  } else {
+    treeSet(t, e.path, text);
+  }
+  return null;
+}
+
+function applyV(t: Tree, e: VEdit, strict: boolean): string | null {
+  switch (e.type) {
+    case 'vadd': {
+      if (!isSafePath(e.path)) return `unsafe ${e.path}`;
+      if (treeGet(t, e.path) !== null) return `exists ${e.path}`;
+      const text = e.lines.length === 0 ? '' : e.lines.join('\n') + '\n';
+      treeSet(t, e.path, text);
+      return null;
+    }
+    case 'vdelete': {
+      if (!isSafePath(e.path)) return `unsafe ${e.path}`;
+      if (treeGet(t, e.path) === null) return `missing ${e.path}`;
+      treeSet(t, e.path, null);
+      return null;
+    }
+    case 'vupdate':
+      return applyVUpdate(t, e, strict);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Applying edits (SPEC sections 6 to 10)
 
 function applyEdit(t: Tree, e: Edit, strict: boolean): string | null {
   switch (e.type) {
     case 'unified':
       return applyUnified(t, e, strict);
+    case 'sr':
+      return applySR(t, e, strict);
+    case 'vadd':
+    case 'vdelete':
+    case 'vupdate':
+      return applyV(t, e, strict);
     case 'jcreate': {
       if (!isSafePath(e.path)) return `unsafe ${e.path}`;
       if (treeGet(t, e.path) !== null) return `exists ${e.path}`;
@@ -772,8 +1060,11 @@ function parsePatch(format: string, text: string, lines: string[]): Edit[] {
       return parseJson(text, lines);
     case 'unified':
       return parseUnified(lines);
+    case 'search-replace':
+      return parseSearchReplace(lines);
+    case 'v4a':
+      return parseV4A(lines);
     default:
-      // The search-replace and v4a readers are added in later stages.
       throw new ParseError(1);
   }
 }
